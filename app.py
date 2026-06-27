@@ -3,12 +3,13 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import re
+import asyncio
+from playwright.async_api import async_playwright
 
-# Download VADER lexicon silently
+# --- INITIALIZATION ---
 nltk.download('vader_lexicon', quiet=True)
 sia = SentimentIntensityAnalyzer()
 
@@ -17,19 +18,105 @@ st.title("📊 Institutional Growth Stock Terminal")
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("Control Panel")
-ticker = st.sidebar.text_input("Ticker (e.g., SIVE.ST, IQE)", value="AAPL").upper()
-sector_etf = st.sidebar.text_input("Sector ETF (e.g., SMH, XBI)", value="SPY").upper()
+ticker = st.sidebar.text_input("Ticker (e.g., SIVE.ST, IQE, NBIS)", value="AAPL").upper()
 portfolio_value = st.sidebar.number_input("Total Portfolio Value ($)", value=100000)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Intelligence Configuration")
+# The "Board of Directors" Logic
+default_profiles = "@MacroWiz:Macro\n@SemiPro:Sector\n@ForensicFred:Value"
+analyst_profiles_raw = st.sidebar.text_area("Analyst Profiles (Handle:Category)", value=default_profiles, height=100)
+sector_keywords_raw = st.sidebar.text_input("Sector/Thesis Keywords (comma sep)", value="GaN, Silicon Carbide, 5G, Compound Semi")
+
 run_btn = st.sidebar.button("Run Analysis", type="primary")
 
+# --- HELPER FUNCTIONS ---
 def calculate_kelly(win_rate=0.45, reward_risk=2.5):
     kelly = win_rate - ((1 - win_rate) / reward_risk)
-    return max(kelly / 2, 0) # Half-Kelly, floor at 0
+    return max(kelly / 2, 0) # Half-Kelly base
 
-@st.cache_data
+@st.cache_data(ttl=3600)
 def get_data(tick):
     return yf.Ticker(tick).history(period="1y")
 
+async def fetch_serenity():
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+            page = await browser.new_page()
+            await page.goto("https://aichainmap.com/serenity/", timeout=20000)
+            await page.wait_for_timeout(6000)
+            text = await page.inner_text('body')
+            await browser.close()
+            return text
+    except Exception as e:
+        return f"SCRAPER_ERROR: {str(e)}"
+
+def process_fintwit_alpha(pasted_text, profiles_raw, sector_kw_raw, target_ticker):
+    """The Routing, Board of Directors, and Conviction Logic Engine"""
+    # Parse Profiles
+    profiles = {}
+    for line in profiles_raw.split('\n'):
+        if ':' in line:
+            handle, category = line.split(':', 1)
+            profiles[handle.strip().lower()] = category.strip().lower()
+            
+    sector_kws = [k.strip().lower() for k in sector_kw_raw.split(',')]
+    macro_kws = ['dxy', 'yields', 'liquidity', 'fed', 'qt', 'credit spreads', 'rates', 'treasury']
+    
+    low_conv = ['interesting', 'radar', 'watching', 'eyes on']
+    med_conv = ['initiated', 'buying', 'adding', 'small position']
+    high_conv = ['conviction', 'full size', 'back up the truck', 'god candle', 'max size']
+
+    outputs = {
+        "macro_alert": None,
+        "ticker_alerts": [],
+        "overall_conviction": "None",
+        "raw_processed": []
+    }
+
+    # Split by @ to process per analyst
+    blocks = re.split(r'(@\w+)', pasted_text)
+    
+    current_handle = "Unknown"
+    for block in blocks:
+        block = block.strip()
+        if not block: continue
+        
+        if block.startswith('@'):
+            current_handle = block.lower()
+            continue
+            
+        # 1. Board of Directors Weighting
+        category = profiles.get(current_handle, "Unknown")
+        weight = 1.0
+        if category == "macro": weight = 0.5 # Less relevant for specific ticker techs
+        if category == "sector": weight = 1.5  # Highly relevant
+        if category == "value": weight = 1.2
+
+        # 2. VADER Sentiment
+        score = sia.polarity_scores(block)['compound']
+        weighted_score = score * weight
+
+        # 3. Routing Logic (Macro vs Ticker)
+        block_lower = block.lower()
+        is_macro = any(kw in block_lower for kw in macro_kws)
+        is_ticker = (target_ticker.lower() in block_lower) or any(kw in block_lower for kw in sector_kws)
+
+        if is_macro:
+            if score < -0.2:
+                outputs["macro_alert"] = f"⚠️ {current_handle} ({category}) Macro Bearish"
+        if is_ticker:
+            outputs["ticker_alerts"].append(f"**{current_handle}** ({category}): Score {weighted_score:.2f}")
+
+        # 4. Conviction Scaling Logic
+        if any(phrase in block_lower for phrase in high_conv): outputs["overall_conviction"] = "High"
+        elif outputs["overall_conviction"] != "High" and any(phrase in block_lower for phrase in med_conv): outputs["overall_conviction"] = "Medium"
+        elif outputs["overall_conviction"] == "None" and any(phrase in block_lower for phrase in low_conv): outputs["overall_conviction"] = "Low"
+
+    return outputs
+
+# --- MAIN APP LOGIC ---
 if run_btn:
     try:
         df = get_data(ticker)
@@ -37,66 +124,64 @@ if run_btn:
             st.error("Ticker not found or no data.")
             st.stop()
         
-        # ---------------------------------------------------------
-        # MODULE 1: GROWTH TECHNICAL ENGINE
-        # ---------------------------------------------------------
-        # Native Pandas calculations (No pandas_ta needed!)
+        # =========================================================
+        # MODULE 1: GROWTH TECHNICAL ENGINE (SANITY FILTERS)
+        # =========================================================
         df['EMA_10'] = df['Close'].ewm(span=10, adjust=False).mean()
         df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['SMA_50'] = df['Close'].rolling(window=50).mean()
         
-        # Manual ATR calculation
         high_low = df['High'] - df['Low']
         high_close = np.abs(df['High'] - df['Close'].shift())
         low_close = np.abs(df['Low'] - df['Close'].shift())
         true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         df['ATR'] = true_range.rolling(window=14).mean()
         
-        # Fibonacci
-        high_1y = df['High'].max()
-        low_1y = df['Low'].min()
-        diff = high_1y - low_1y
-        fib_382 = high_1y - (0.382 * diff)
-        fib_50 = high_1y - (0.5 * diff)
+        current_price = df['Close'].iloc[-1]
+        atr = df['ATR'].iloc[-1]
         
-        # Capitulation Spike
+        high_1y = df['High'].max()
+        if high_1y > (current_price * 1.5):
+            recent_df = df.tail(126)
+            high_base = recent_df['High'].max()
+            low_base = recent_df['Low'].min()
+        else:
+            high_base = high_1y
+            low_base = df['Low'].min()
+            
+        diff = high_base - low_base
+        fib_50 = high_base - (0.5 * diff)
+        
         df['Avg_Range'] = (df['High'] - df['Low']).rolling(20).mean()
         df['Avg_Vol'] = df['Volume'].rolling(20).mean()
         df['Capitulation'] = ((df['High'] - df['Low']) > (2.5 * df['Avg_Range'])) & (df['Volume'] > (3 * df['Avg_Vol']))
         
-        # VWAP
+        recent_30 = df.tail(30)
+        recent_caps = recent_30[recent_30['Capitulation'] == True]
+        gaps = recent_30[recent_30['Open'] > recent_30['Close'].shift(1) * 1.02]
         df['VWAP_20'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).rolling(20).sum() / df['Volume'].rolling(20).sum()
         
-        # Gap Fill (Simplified: find if close > high of prev day by > 1%)
-        df['Gap_Up'] = df['Close'].shift(1) * 1.01 < df['Open']
-        gap_support = df.loc[df['Gap_Up'] == True, 'Open'].min()
-        
-        current_price = df['Close'].iloc[-1]
-        atr = df['ATR'].iloc[-1]
+        max_acceptable_drop = current_price * 0.70 
         avg_vol = df['Avg_Vol'].iloc[-1]
         
-        # Determine Buy Levels
         buy_levels = {}
-        # Check for capitulation near fibs
-        recent_cap = df[df['Capitulation'] == True].tail(3)
-        if not recent_cap.empty:
-            buy_levels['Capitulation Spike'] = recent_cap['Low'].min()
-        
-        if not np.isnan(gap_support) and gap_support < current_price:
-            buy_levels['Gap Fill Support'] = gap_support
-            
+        if not recent_caps.empty:
+            cap_level = recent_caps['Low'].min()
+            if current_price > cap_level > max_acceptable_drop: buy_levels['Capitulation Spike'] = cap_level
+        if not gaps.empty:
+            gap_support = gaps['Open'].min()
+            if current_price > gap_support > max_acceptable_drop: buy_levels['Gap Fill Support'] = gap_support
         vwap = df['VWAP_20'].iloc[-1]
-        if vwap < current_price:
-            buy_levels['20D VWAP'] = vwap
+        if not np.isnan(vwap):
+            if current_price > vwap > max_acceptable_drop: buy_levels['20D VWAP'] = vwap
 
-        # ---------------------------------------------------------
+        # =========================================================
         # MODULE 2: MACRO MATRIX
-        # ---------------------------------------------------------
+        # =========================================================
         vix = yf.Ticker("^VIX").history(period="1mo")['Close'].iloc[-1]
         tnx = yf.Ticker("^TNX").history(period="3mo")
         tnx_sma_50 = tnx['Close'].tail(50).mean()
         tnx_current = tnx['Close'].iloc[-1]
-        
         ndx = yf.Ticker("^NDX").history(period="3mo")
         ndx_sma_50 = ndx['Close'].tail(50).mean()
         ndx_current = ndx['Close'].iloc[-1]
@@ -105,38 +190,28 @@ if run_btn:
         macro_warning = ""
         if tnx_current > tnx_sma_50 or ndx_current < ndx_sma_50:
             macro_blocker = True
-            macro_warning = "🚨 HARD OVERRIDE: Growth Liquidity Crisis (Rates rising or Nasdaq broken)"
+            macro_warning = "🚨 HARD OVERRIDE: Growth Liquidity Crisis"
         elif vix > 25:
             macro_warning = "⚠️ WARNING: Elevated Fear (VIX > 25). Size reduced 50%."
 
-        # ---------------------------------------------------------
-        # MODULE 3 & 4: SENTIMENT ENGINES (UI DRIVEN)
-        # ---------------------------------------------------------
-        # We handle News and FinTwit in the UI tabs to avoid complex async API calls in this simple script.
-        
-        # ---------------------------------------------------------
-        # TABS LAYOUT
-        # ---------------------------------------------------------
+        # =========================================================
+        # UI LAYOUT
+        # =========================================================
         tab1, tab2, tab3, tab4 = st.tabs(["Chart & Techs", "Macro & Fundamentals", "NLP Sentiment Engine", "Final Trade Ticket"])
         
         with tab1:
             st.subheader("Growth Technical Matrix")
-            fig = make_subplots(rows=1, cols=1)
+            fig = go.Figure()
             fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"))
             fig.add_trace(go.Scatter(x=df.index, y=df['EMA_10'], mode='lines', name='EMA 10', line=dict(color='blue', width=1)))
             fig.add_trace(go.Scatter(x=df.index, y=df['EMA_20'], mode='lines', name='EMA 20', line=dict(color='orange', width=1)))
             fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], mode='lines', name='SMA 50', line=dict(color='red', width=2)))
-            
-            # Plot Buy Levels
             colors = ['lime', 'cyan', 'purple']
             for i, (name, level) in enumerate(buy_levels.items()):
                 fig.add_hline(y=level, line_dash="dash", line_color=colors[i%3], annotation_text=f"{name}: ${level:.2f}")
-                
-            # Plot Capitulation Spikes
             cap_dates = df[df['Capitulation'] == True].index
             cap_lows = df[df['Capitulation'] == True]['Low']
             fig.add_trace(go.Scatter(x=cap_dates, y=cap_lows, mode='markers', marker=dict(color='red', size=10, symbol='triangle-down'), name='Capitulation'))
-            
             fig.update_layout(xaxis_rangeslider_visible=False, height=700)
             st.plotly_chart(fig, use_container_width=True)
 
@@ -144,82 +219,119 @@ if run_btn:
             st.metric("VIX", f"{vix:.2f}", "Elevated" if vix > 25 else "Normal")
             st.metric("10Y Yield vs 50SMA", f"{tnx_current:.2f}", "Dangerous" if tnx_current > tnx_sma_50 else "Safe")
             st.metric("Nasdaq vs 50SMA", f"{ndx_current:.2f}", "Broken" if ndx_current < ndx_sma_50 else "Healthy")
-            if macro_blocker:
-                st.error(macro_warning)
-            elif macro_warning:
-                st.warning(macro_warning)
-            else:
-                st.success("✅ Macro environment is clear for growth stocks.")
-
+            if macro_blocker: st.error(macro_warning)
+            elif macro_warning: st.warning(macro_warning)
+            else: st.success("✅ Macro environment clear.")
             st.subheader("Microstructure Checks")
-            st.write(f"**Liquidity Filter:** Avg Daily Volume: {avg_vol:,.0f} {'(LOW - Size Halved)' if avg_vol < 100000 else '(OK)'}")
-            if current_price < fib_50:
-                st.warning("⚠️ Deep Retracement: Price is below 50% Fib. Growth thesis may be compromised.")
-            else:
-                st.success("✅ Shallow Retracement: Price holding above critical 50% Fib level.")
+            st.write(f"**Liquidity:** {avg_vol:,.0f} shares/day {'(LOW - Size Halved)' if avg_vol < 100000 else '(OK)'}")
+            if current_price < fib_50: st.warning("⚠️ Deep Retracement: Below 50% Fib.")
+            else: st.success("✅ Shallow Retracement: Holding above 50% Fib.")
 
         with tab3:
-            st.subheader("Automated News Sentiment (Free Yahoo Feed)")
+            st.subheader("1. Automated Serenity Ingestion")
+            if st.button("Fetch Serenity Analysis", key="serenity_btn"):
+                with st.spinner("Launching headless browser..."):
+                    serenity_text = asyncio.run(fetch_serenity())
+                    if "SCRAPER_ERROR" in serenity_text:
+                        st.error("Failed to scrape Serenity (Cloudflare block or missing packages.txt). Use manual paste below.")
+                    else:
+                        st.success("Successfully ingested Serenity Alpha!")
+                        with st.expander("View Raw Serenity Text"): st.text(serenity_text[:1500])
+
+            st.markdown("---")
+            st.subheader("2. Free Yahoo News Sentiment")
             news = yf.Ticker(ticker).news
+            news_score = 0
             if news:
-                news_score = 0
                 pos_words = ['beat', 'raised', 'surge', 'bullish', 'upgrade', 'partnership']
                 neg_words = ['missed', 'crash', 'investigation', 'layoff', 'downgrade', 'warning']
-                
                 for article in news[:5]:
                     title = article.get('title', '')
                     for w in pos_words: news_score += 1 if w in title.lower() else 0
                     for w in neg_words: news_score -= 1 if w in title.lower() else 0
                     st.write(f"- {title}")
-                
                 st.metric("News Sentiment Score", news_score, "Positive" if news_score > 0 else "Negative")
-                if news_score < -2: st.error("NEWS OVERRIDE: Negative catalyst detected.")
-            else:
-                st.write("No news found.")
 
             st.markdown("---")
-            st.subheader("FinTwit OSINT Distiller (Paste Alpha Here)")
-            tweets = st.text_area("Paste tweets/threads from your smart accounts here:", height=150)
+            st.subheader("3. FinTwit OSINT Distiller (Routing & Conviction)")
+            st.caption("Paste tweets prefixed with @Handle to trigger Board of Directors logic.")
+            tweets = st.text_area("Paste tweets here:", height=200, placeholder="@MacroWiz: DXY is breaking out, very bearish.\n@SemiGuru: $IQE looks great here, back up the truck.")
+            
             if tweets:
-                sentiment_scores = [sia.polarity_params(t)['compound'] for t in tweets.split('\n') if t.strip()]
-                avg_score = np.mean(sentiment_scores) if sentiment_scores else 0
-                st.metric("FinTwit VADER Score", f"{avg_score:.2f}", "Bullish" if avg_score > 0.2 else ("Bearish" if avg_score < -0.2 else "Neutral"))
+                # Run the complex logic engine
+                fintwit_results = process_fintwit_alpha(tweets, analyst_profiles_raw, sector_keywords_raw, ticker)
                 
-                # Extract tickers
-                tickers_found = re.findall(r'\$([A-Za-z]{2,4})\b', tweets)
-                if tickers_found:
-                    st.write("**Mentioned Tickers:**", ", ".join(set(tickers_found)))
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Overall Conviction", fintwit_results["overall_conviction"])
+                    if fintwit_results["overall_conviction"] == "High":
+                        st.success("🚀 High Conviction detected. Standard Kelly cuts will be overridden.")
+                with col2:
+                    if fintwit_results["macro_alert"]:
+                        st.warning(fintwit_results["macro_alert"])
+                    else:
+                        st.info("No Macro routing triggers found.")
+                
+                if fintwit_results["ticker_alerts"]:
+                    st.markdown("**Ticker/Thesis Routing Alerts:**")
+                    for alert in fintwit_results["ticker_alerts"]:
+                        st.write(f"→ {alert}")
 
         with tab4:
             st.subheader("Final Trade Ticket Synthesis")
             
             base_kelly = calculate_kelly()
             kelly_size = base_kelly * portfolio_value
+            base_kelly_size = kelly_size # Store original for High Conviction override
             
-            # Apply Reductions
             reduction_reasons = []
+            
+            # Standard Reductions
             if vix > 25: kelly_size *= 0.5; reduction_reasons.append("High VIX")
             if avg_vol < 100000: kelly_size *= 0.5; reduction_reasons.append("Low Liquidity")
             
+            # FinTwit Logic Modifiers
+            if 'tweets' in locals() and tweets:
+                fintwit_results = process_fintwit_alpha(tweets, analyst_profiles_raw, sector_keywords_raw, ticker)
+                
+                # 1. Check Macro Routing Blocker
+                if fintwit_results["macro_alert"]:
+                    macro_blocker = True
+                    macro_warning = f"🚨 FINtwIT OVERRIDE: {fintwit_results['macro_alert']}"
+                
+                # 2. Check Conviction Scaling Override
+                if fintwit_results["overall_conviction"] == "High" and ticker in tweets.lower():
+                    # Restore to base Kelly if it was cut by VIX/Liquidity
+                    kelly_size = base_kelly_size
+                    reduction_reasons = [r for r in reduction_reasons if r not in ["High VIX", "Low Liquidity"]] # Remove standard cuts
+                    reduction_reasons.append("OVERRIDDEN: High FinTwit Conviction")
+
             final_decision = "DO NOT BUY"
             decision_color = "red"
             
             if macro_blocker:
-                final_decision = "DO NOT BUY (Macro Override)"
-            elif buy_levels and not (current_price < fib_50):
-                final_decision = "BUY"
-                decision_color = "green"
-                if reduction_reasons:
+                final_decision = f"DO NOT BUY ({macro_warning})"
+            elif not buy_levels:
+                final_decision = "DO NOT BUY (No Valid Levels - Structural breakdown)"
+            elif current_price < fib_50:
+                final_decision = "DO NOT BUY (Deep Retracement > 50%)"
+            else:
+                if reduction_reasons and "OVERRIDDEN" not in reduction_reasons[0]:
                     final_decision = f"REDUCE SIZE (50% cut: {', '.join(reduction_reasons)})"
                     decision_color = "orange"
+                else:
+                    final_decision = "BUY (Full/Overridden Size)"
+                    decision_color = "green"
 
             st.markdown(f"### <span style='color:{decision_color}'>{final_decision}</span>", unsafe_allow_html=True)
             
-            if final_decision != "DO NOT BUY" and final_decision != "DO NOT BUY (Macro Override)":
+            if "BUY" in final_decision:
                 for name, level in buy_levels.items():
-                    stop_loss = level - (2 * atr)
+                    stop_loss = max(level - (2 * atr), 0.01)
                     risk_per_share = level - stop_loss
-                    shares_to_buy = int(kelly_size / risk_per_share) if risk_per_share > 0 else 0
+                    if risk_per_share <= 0: continue
+                        
+                    shares_to_buy = int(kelly_size / risk_per_share)
                     cost = shares_to_buy * level
                     
                     st.markdown(f"**Level: {name}**")
@@ -231,4 +343,4 @@ if run_btn:
                     st.divider()
 
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Critical Data Error: {e}")
