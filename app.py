@@ -41,10 +41,17 @@ if run_btn:
         # ---------------------------------------------------------
         # MODULE 1: GROWTH TECHNICAL ENGINE
         # ---------------------------------------------------------
-        df['EMA_10'] = ta.ema(df['Close'], length=10)
-        df['EMA_20'] = ta.ema(df['Close'], length=20)
-        df['SMA_50'] = ta.sma(df['Close'], length=50)
-        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        # Native Pandas calculations (No pandas_ta needed!)
+        df['EMA_10'] = df['Close'].ewm(span=10, adjust=False).mean()
+        df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        
+        # Manual ATR calculation
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['ATR'] = true_range.rolling(window=14).mean()
         
         # Fibonacci
         high_1y = df['High'].max()
