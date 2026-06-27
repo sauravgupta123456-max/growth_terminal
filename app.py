@@ -34,6 +34,7 @@ if run_btn:
         df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['SMA_50'] = df['Close'].rolling(window=50).mean()
         
+        # Calculate True Range / Daily Range
         high_low = df['High'] - df['Low']
         high_close = np.abs(df['High'] - df['Close'].shift())
         low_close = np.abs(df['Low'] - df['Close'].shift())
@@ -76,10 +77,10 @@ if run_btn:
             buy_levels['🏀 Gap Fill Trampoline'] = best_gap_level
 
         # C. THE PANIC FLUSH (Capitulation Spike)
-        df['Avg_Range'] = (df['High'] - df['Low']).rolling(20).mean()
+        df['Avg_Range'] = high_low.rolling(20).mean() # Fixed: use high_low instead of df['Range']
         df['Avg_Vol'] = df['Volume'].rolling(20).mean()
         # Range > 2.5x normal AND Volume > 3x normal
-        df['Is_Capitulation'] = (df['Range'] > (2.5 * df['Avg_Range'])) & (df['Volume'] > (3 * df['Avg_Vol']))
+        df['Is_Capitulation'] = (high_low > (2.5 * df['Avg_Range'])) & (df['Volume'] > (3 * df['Avg_Vol']))
         
         recent_caps = df.tail(30)[df.tail(30)['Is_Capitulation']]
         if not recent_caps.empty:
