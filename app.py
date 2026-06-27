@@ -5,7 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 
 st.set_page_config(layout="wide", page_title="Buy Level Generator")
-st.title("🎯 Growth Stock Buy Level Generator")
+st.title("🎯 Structural Buy Level Generator")
 
 # --- SIDEBAR ---
 st.sidebar.header("Configuration")
@@ -30,8 +30,7 @@ if run_btn:
             st.error("Ticker not found.")
             st.stop()
         
-        # 1. CALCULATE INDICATORS
-        df['EMA_10'] = df['Close'].ewm(span=10, adjust=False).mean()
+        # 1. CALCULATE BASE INDICATORS
         df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['SMA_50'] = df['Close'].rolling(window=50).mean()
         
@@ -44,89 +43,123 @@ if run_btn:
         current_price = df['Close'].iloc[-1]
         atr = df['ATR'].iloc[-1]
         
-        # 2. FIND BUY LEVELS (Always calculate them)
-        high_1y = df['High'].max()
-        low_1y = df['Low'].min()
+        # -----------------------------------------------------------------
+        # STRUCTURAL BUY LEVEL ENGINE
+        # -----------------------------------------------------------------
+        buy_levels = {}
+
+        # A. THE INSTITUTIONAL ANCHOR (Anchored VWAP from 60-day high)
+        lookback = 60
+        recent_data = df.tail(lookback)
+        if not recent_data.empty:
+            swing_high_idx = recent_data['High'].idxmax()
+            # Calculate VWAP from that exact peak to today
+            anchor_df = df.loc[swing_high_idx:]
+            tp = (anchor_df['High'] + anchor_df['Low'] + anchor_df['Close']) / 3
+            anchored_vwap = (tp * anchor_df['Volume']).cumsum() / anchor_df['Volume'].cumsum()
+            current_anchored_vwap = anchored_vwap.iloc[-1]
+            if not np.isnan(current_anchored_vwap):
+                buy_levels['⚓️ Institutional Anchor (Anchored VWAP)'] = current_anchored_vwap
+
+        # B. MARKET MECHANICS (Gap Fills - The Trampoline)
+        df['Prev_High'] = df['High'].shift(1)
+        # A gap up is when today's low is higher than yesterday's high
+        df['Is_Gap_Up'] = df['Low'] > df['Prev_High'] 
+        # The "trampoline" is yesterday's high (the bottom of the empty space)
+        df['Gap_Support_Level'] = np.where(df['Is_Gap_Up'], df['Prev_High'], np.nan)
         
-        # Use 6-month data if stock is down massively to avoid zombie levels
-        if high_1y > (current_price * 1.5):
-            recent_df = df.tail(126)
-            high_base = recent_df['High'].max()
-            low_base = recent_df['Low'].min()
-        else:
-            high_base = high_1y
-            low_base = low_1y
-            
-        diff = high_base - low_base
-        fib_382 = high_base - (0.382 * diff)
-        fib_50 = high_base - (0.5 * diff)
-        
-        # Capitulation (Last 30 days only)
+        # Find the highest recent gap support level that is below current price
+        recent_gaps = df.tail(30)[(df.tail(30)['Is_Gap_Up']) & (df.tail(30)['Gap_Support_Level'] < current_price)]
+        if not recent_gaps.empty:
+            # We want the highest gap level below price for the best bouncy support
+            best_gap_level = recent_gaps['Gap_Support_Level'].max()
+            buy_levels['🏀 Gap Fill Trampoline'] = best_gap_level
+
+        # C. THE PANIC FLUSH (Capitulation Spike)
         df['Avg_Range'] = (df['High'] - df['Low']).rolling(20).mean()
         df['Avg_Vol'] = df['Volume'].rolling(20).mean()
-        df['Capitulation'] = ((df['High'] - df['Low']) > (2.5 * df['Avg_Range'])) & (df['Volume'] > (3 * df['Avg_Vol']))
-        recent_caps = df.tail(30)[df.tail(30)['Capitulation'] == True]
+        # Range > 2.5x normal AND Volume > 3x normal
+        df['Is_Capitulation'] = (df['Range'] > (2.5 * df['Avg_Range'])) & (df['Volume'] > (3 * df['Avg_Vol']))
         
-        # Gaps (Last 30 days only)
-        recent_30 = df.tail(30)
-        gaps = recent_30[recent_30['Open'] > recent_30['Close'].shift(1) * 1.02]
-        
-        # VWAP
-        df['VWAP_20'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).rolling(20).sum() / df['Volume'].rolling(20).sum()
-        
-        # Compile Levels Dictionary
-        buy_levels = {}
-        if not recent_caps.empty: buy_levels['Capitulation Spike'] = recent_caps['Low'].min()
-        if not gaps.empty: buy_levels['Gap Fill Support'] = gaps['Open'].min()
-        if not np.isnan(df['VWAP_20'].iloc[-1]): buy_levels['20D VWAP'] = df['VWAP_20'].iloc[-1]
-        buy_levels['38.2% Fibonacci'] = fib_382
-        
+        recent_caps = df.tail(30)[df.tail(30)['Is_Capitulation']]
+        if not recent_caps.empty:
+            # The buy level is the absolute bottom wick of that panic day
+            cap_level = recent_caps['Low'].min()
+            buy_levels['🩸 Panic Flush (Capitulation Spike)'] = cap_level
+
+        # D. HEALTHY PULLBACK (20 EMA)
+        ema_20_val = df['EMA_20'].iloc[-1]
+        if not np.isnan(ema_20_val):
+            buy_levels['🟢 Healthy Pullback (20 EMA)'] = ema_20_val
+
         # Sort levels from highest to lowest (closest to current price first)
         buy_levels = dict(sorted(buy_levels.items(), key=lambda item: item[1], reverse=True))
 
-        # 3. RISK MANAGEMENT MATH
+        # -----------------------------------------------------------------
+        # RISK MANAGEMENT MATH
+        # -----------------------------------------------------------------
         base_kelly = calculate_kelly()
         kelly_size = base_kelly * portfolio_value
-        
         avg_vol = df['Avg_Vol'].iloc[-1]
-        if avg_vol < 100000: kelly_size *= 0.5 # Liquidity cut
+        
+        if avg_vol < 100000: 
+            kelly_size *= 0.5 # Liquidity cut
 
-        # 4. DRAW CHART
+        # -----------------------------------------------------------------
+        # DRAW CHART
+        # -----------------------------------------------------------------
         fig = go.Figure()
         fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"))
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], mode='lines', name='50 SMA', line=dict(color='red', width=2)))
         
-        # Plot Buy Levels on Chart
-        colors = ['lime', 'cyan', 'purple', 'blue']
-        for i, (name, level) in enumerate(buy_levels.items()):
+        # Plot moving averages
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_20'], mode='lines', name='20 EMA', line=dict(color='cyan', width=2)))
+        fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], mode='lines', name='50 SMA (Trend Filter)', line=dict(color='red', width=2, dash='dot')))
+        
+        # Plot the Structural Buy Levels
+        level_colors = {
+            '⚓️ Institutional Anchor (Anchored VWAP)': 'blue',
+            '🏀 Gap Fill Trampoline': 'purple',
+            '🩸 Panic Flush (Capitulation Spike)': 'red',
+            '🟢 Healthy Pullback (20 EMA)': 'lime'
+        }
+        
+        for name, level in buy_levels.items():
             if level < current_price: # Only plot levels below current price
-                fig.add_hline(y=level, line_dash="dash", line_color=colors[i%4], annotation_text=f"{name}: ${level:.2f}")
+                color = level_colors.get(name, 'white')
+                fig.add_hline(y=level, line_dash="dash", line_width=2, line_color=color, annotation_text=name)
                 
-        fig.update_layout(xaxis_rangeslider_visible=False, height=600, title=f"{ticker} - Current: ${current_price:.2f}")
+        # Mark Capitulation Spikes with big red triangles
+        cap_dates = df[df['Is_Capitulation'] == True].index
+        cap_lows = df[df['Is_Capitulation'] == True]['Low']
+        fig.add_trace(go.Scatter(x=cap_dates, y=cap_lows, mode='markers', marker=dict(color='red', size=12, symbol='triangle-down'), name='Capitulation Day'))
+
+        fig.update_layout(xaxis_rangeslider_visible=False, height=700, title=f"{ticker} - Current: ${current_price:.2f}")
         st.plotly_chart(fig, use_container_width=True)
 
-        # 5. PRINT THE BUY LEVELS CLEARLY
-        st.subheader("📊 Actionable Buy Levels & Position Sizing")
+        # -----------------------------------------------------------------
+        # PRINT THE BUY LEVELS TABLE
+        # -----------------------------------------------------------------
+        st.subheader("📊 Structural Buy Levels & Position Sizing")
         
         warnings = []
-        if current_price < fib_50: warnings.append("⚠️ Deep Retracement: Stock is down >50% from recent high.")
+        if current_price < df['SMA_50'].iloc[-1]: warnings.append("🚨 TREND BROKEN: Stock is below 50 SMA. High risk of falling knife.")
         if avg_vol < 100000: warnings.append("⚠️ Low Liquidity: Slippage risk high.")
         
         if warnings:
             for w in warnings:
                 st.warning(w)
-            st.markdown("*Levels shown below for monitoring, but exercise extreme caution.*")
 
-        # Display Table
+        if not any(l < current_price for l in buy_levels.values()):
+            st.info("Stock is in a strong uptrend. No structural pullback levels are currently below the price.")
+
         for name, level in buy_levels.items():
-            # If the level is above current price, skip it (we don't want to buy higher than current price)
             if level >= current_price:
-                continue
+                continue # Skip levels above current price
                 
-            stop_loss = max(level - (2 * atr), 0.01) # Never let stop be negative
+            stop_loss = max(level - (2 * atr), 0.01) 
             risk_per_share = level - stop_loss
             
-            if risk_per_share <= 0: continue # Skip broken math
+            if risk_per_share <= 0: continue 
             
             shares_to_buy = int(kelly_size / risk_per_share)
             cost = shares_to_buy * level
